@@ -44,6 +44,11 @@ def test_validates_meta_rift_store_urls() -> None:
     assert is_valid_rift_store_url(
         "https://www.meta.com/en-gb/experiences/pcvr/lone-echo/1368187813209608/"
     )
+    # Cross-buy titles (e.g. Hyper Dash) keep their generic store URL, with no
+    # "pcvr" storefront segment, even though a PC VR build exists.
+    assert is_valid_rift_store_url(
+        "https://www.meta.com/fr-fr/experiences/hyper-dash/3070239359662935/"
+    )
     assert not is_valid_rift_store_url("123456789")
     assert not is_valid_rift_store_url(
         "https://www.meta.com/experiences/quest/vader-immortal/123456789/"
