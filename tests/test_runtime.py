@@ -1,6 +1,7 @@
 import hashlib
 import io
 import json
+import sys
 import tarfile
 import zipfile
 from pathlib import Path
@@ -23,11 +24,13 @@ from riftlift.runtime import (
     _install_meta_signing_root,
     _meta_signing_root_der,
     _meta_signing_root_registry_blob,
+    _raw_python_interpreter,
     _safe_tar,
     initialize_prefix,
     install_dxvk_compat,
     install_meta_runtime,
     install_openvr_runtime,
+    install_openxr_layer,
     install_proton,
     install_rift_runtime,
     meta_signing_root_installed,
@@ -35,11 +38,47 @@ from riftlift.runtime import (
     select_openvr_runtime,
     shutdown_compat_prefix,
     steamvr_runtime_for_openxr,
+    validate_openvr_library,
 )
 from riftlift.util import RiftLiftError
 
+
+def test_openxr_layer_registration_is_private_and_idempotent(tmp_path, monkeypatch):
+    paths = Paths(
+        *(
+            tmp_path / name
+            for name in ("data", "cache", "config", "games", "prefix", "tools")
+        )
+    )
+    directory = paths.tools / "rift-runtime"
+    directory.mkdir(parents=True)
+    (directory / "RiftLiftOpenXRLayer.dll").write_bytes(b"test")
+    registry = paths.prefix / "pfx/system.reg"
+    registry.parent.mkdir(parents=True)
+    calls = []
+
+    def register(actual_paths, key, name, kind, value):
+        assert actual_paths == paths
+        calls.append((key, name, kind, value))
+        section = key.removeprefix("HKLM\\").replace("\\", "\\\\")
+        escaped = name.replace("\\", "\\\\")
+        registry.write_text(f'[{section}]\n"{escaped}"=dword:00000000\n\n')
+
+    monkeypatch.setattr("riftlift.runtime._registry_add", register)
+    install_openxr_layer(paths)
+    install_openxr_layer(paths)
+    assert len(calls) == 1
+    assert calls[0][0] == r"HKLM\Software\Khronos\OpenXR\1\ApiLayers\Implicit"
+    assert calls[0][2:] == ("REG_DWORD", "0")
+    layer = json.loads((directory / "openxr-layer.json").read_text())["api_layer"]
+    assert layer["library_path"].endswith(r"\rift-runtime\RiftLiftOpenXRLayer.dll")
+    assert layer["enable_environment"] == "RIFTLIFT_OVR_COMPAT"
+    assert layer["disable_environment"] == "RIFTLIFT_DISABLE_OVR_COMPAT"
+
+
 REQUIRED_RUNTIME_FILES = (
     "RiftLiftLauncher.exe",
+    "RiftLiftOpenXRLayer.dll",
     "RiftLiftOpenXR64.dll",
     "RiftLiftOpenVR64.dll",
     "openvr_api64.dll",
@@ -600,6 +639,8 @@ def test_meta_signing_root_check_reads_actual_wine_store(tmp_path: Path) -> None
 
 
 def test_openvr_runtime_is_installed_and_versioned(tmp_path, monkeypatch):
+    validated = []
+    monkeypatch.setattr("riftlift.runtime.validate_openvr_library", validated.append)
     paths = Paths(
         tmp_path / "data",
         tmp_path / "cache",
@@ -633,6 +674,93 @@ def test_openvr_runtime_is_installed_and_versioned(tmp_path, monkeypatch):
     assert registry["log"] == [str(paths.data / "diagnostics/openvr")]
     archive.unlink()
     assert install_openvr_runtime(paths) == destination
+    assert len(validated) == 2
+    assert validated[-1] == destination / "libxrizer.so"
+
+
+def test_openvr_library_rejects_an_invalid_binary(tmp_path):
+    library = tmp_path / "libxrizer.so"
+    library.write_bytes(b"not a shared library")
+    with pytest.raises(RiftLiftError, match="XRizer cannot load"):
+        validate_openvr_library(library)
+
+
+def test_raw_python_interpreter_prefers_the_bundled_appimage_python(
+    tmp_path, monkeypatch
+):
+    # Inside a python-appimage build, sys.executable is patched to report the
+    # outer .AppImage file itself (so a script can relaunch the whole app),
+    # not the bundled interpreter - invoking that with -c just reruns
+    # RiftLift's own CLI instead of executing the given code.
+    app_dir = tmp_path / "AppDir"
+    version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    bundled = app_dir / "usr/bin" / version
+    bundled.parent.mkdir(parents=True)
+    bundled.write_text("")
+    monkeypatch.setenv("APPDIR", str(app_dir))
+
+    assert _raw_python_interpreter() == str(bundled)
+
+
+def test_raw_python_interpreter_falls_back_outside_an_appimage(monkeypatch):
+    monkeypatch.delenv("APPDIR", raising=False)
+
+    assert _raw_python_interpreter() == sys.executable
+
+
+def test_raw_python_interpreter_falls_back_when_appdir_has_no_bundled_python(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("APPDIR", str(tmp_path / "does-not-exist"))
+
+    assert _raw_python_interpreter() == sys.executable
+
+
+def test_version_marker_does_not_hide_an_unloadable_openvr_runtime(tmp_path):
+    paths = Paths(
+        *(
+            tmp_path / name
+            for name in ("data", "cache", "config", "games", "prefix", "tools")
+        )
+    )
+    destination = paths.tools / "openvr-runtime"
+    (destination / "bin/linux64").mkdir(parents=True)
+    (destination / "libxrizer.so").write_bytes(b"not a shared library")
+    (destination / "bin/linux64/vrclient.so").write_bytes(b"not a shared library")
+    (destination / ".riftlift-version").write_text(OPENVR_RUNTIME_VERSION)
+    (destination / "bin/version.txt").write_text(OPENVR_RUNTIME_VERSION)
+    from riftlift.runtime import OPENVR_RUNTIME_FILES, _record_payload_files
+
+    _record_payload_files(destination, OPENVR_RUNTIME_FILES)
+
+    with pytest.raises(RiftLiftError, match="XRizer cannot load"):
+        install_openvr_runtime(paths)
+    assert not (paths.config / "openvr/openvrpaths.vrpath").exists()
+
+
+def test_unloadable_openvr_archive_preserves_installed_payload(tmp_path, monkeypatch):
+    paths = Paths(
+        *(
+            tmp_path / name
+            for name in ("data", "cache", "config", "games", "prefix", "tools")
+        )
+    )
+    destination = paths.tools / "openvr-runtime"
+    destination.mkdir(parents=True)
+    (destination / "working.txt").write_text("keep")
+    archive = tmp_path / "unloadable.tar.gz"
+    with tarfile.open(archive, "w:gz") as bundle:
+        payload = b"not a shared library"
+        info = tarfile.TarInfo("xrizer/libxrizer.so")
+        info.size = len(payload)
+        bundle.addfile(info, io.BytesIO(payload))
+    monkeypatch.setenv("RIFTLIFT_OPENVR_RUNTIME_ARCHIVE", str(archive))
+
+    with pytest.raises(RiftLiftError, match="XRizer cannot load"):
+        install_openvr_runtime(paths)
+
+    assert (destination / "working.txt").read_text() == "keep"
+    assert not (destination / ".riftlift-version").exists()
 
 
 def test_incomplete_openvr_archive_preserves_installed_payload(
